@@ -1,0 +1,27 @@
+# Terraform state files (機密情報を含む)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform variables (AWSキー、シークレット等)
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform plan files (機密情報を含む可能性)
+tfplan
+*.tfplan
+
+# Terraform cache (プロバイダーバイナリ、大容量)
+.terraform/
+
+# Lambda deployment package (大容量、ビルド成果物)
+function.zip
+*.zip
+
+# Test images (必要に応じて)
+image.png
+*.png
+*.jpg
+
+# Logs
+*.log
