@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -21,27 +23,26 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"golang.org/x/image/draw"
+	"github.com/disintegration/imaging"
 )
 
-const maxBytes = 10 * 1024 * 1024 // 10MB
+const (
+	maxBytes              = 10 * 1024 * 1024 // 10MB
+	cacheControlImmutable = "public, max-age=31536000, immutable"
+)
 
 var (
 	s3Client   *s3.Client
 	bucketName string
-	// 許可する幅
-	allowedWidths = map[int]bool{240: true, 300: true, 460: true, 700: true, 1040: true}
 )
 
 func main() {
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("unable to load SDK config, %v", err))
 	}
 	s3Client = s3.NewFromConfig(cfg)
 
-	// バケット名を環境変数から取得
 	bucketName = os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
 		panic("BUCKET_NAME environment variable is required")
@@ -51,229 +52,196 @@ func main() {
 }
 
 func handler(ctx context.Context, ev events.S3ObjectLambdaEvent) (any, error) {
-	log.Printf("[DEBUG] Event: %+v", ev)
-	log.Printf("[DEBUG] GetObjectContext: %+v", ev.GetObjectContext)
-	log.Printf("[DEBUG] UserRequest Headers: %+v", ev.UserRequest.Headers)
-
-	// 1) クエリパラメータから幅と高さを取得
-	reqURL := ev.UserRequest.URL
-	log.Printf("DEBUG: Request URL = %s", reqURL)
-
-	u, err := url.Parse(reqURL)
+	b, err := json.MarshalIndent(ev, "", "  ")
 	if err != nil {
-		return nil, writeError(ctx, ev, http.StatusBadRequest, "invalid request URL")
+		log.Printf("DEBUG: Failed to marshal event: %v", err)
+	} else {
+		log.Printf("DEBUG: Event = %s", string(b))
 	}
 
-	log.Printf("DEBUG: Path = %s, RawQuery = %s", u.Path, u.RawQuery)
-
-	// クエリパラメータから取得
-	query := u.Query()
-	log.Printf("DEBUG: Query params: w=%s, h=%s", query.Get("w"), query.Get("h"))
-
-	width, err := strconv.Atoi(query.Get("w"))
-	if err != nil || !allowedWidths[width] {
-		log.Printf("DEBUG: Width parse error or invalid: %v, allowed widths: %v", width, allowedWidths)
-		return nil, writeError(ctx, ev, http.StatusBadRequest, "width must be one of 240,300,460,700,1040")
-	}
-
-	// 高さパラメータの取得（指定がない場合は幅と同じ＝正方形）
-	height, _ := strconv.Atoi(query.Get("h"))
-	if height == 0 {
-		height = width
-	}
-
-	// 2) パスから元画像のキーを取得
-	srcKeyBase := strings.TrimPrefix(u.Path, "/")
-	if srcKeyBase == "" {
-		return nil, writeError(ctx, ev, http.StatusBadRequest, "empty path")
-	}
-
-	// 3) 元画像を S3 GetObject で取得（最大10MBに制限）
-	orig, _, err := fetchOriginalFromS3(ctx, bucketName, srcKeyBase)
+	u, err := url.Parse(ev.UserRequest.URL)
 	if err != nil {
-		var nsk *s3types.NoSuchKey
-		if errors.As(err, &nsk) {
-			return nil, writeError(ctx, ev, http.StatusNotFound, "base image not found")
-		}
-		return nil, writeError(ctx, ev, http.StatusBadGateway, "failed to fetch original: "+err.Error())
+		return nil, fmt.Errorf("failed to parse URL: %w", err)
 	}
 
-	img, format, err := image.Decode(bytes.NewReader(orig))
+	targetWidth, err := parseURLToTargetWidth(u)
 	if err != nil {
-		return nil, writeError(ctx, ev, http.StatusUnsupportedMediaType, "decode error (jpeg/png only): "+err.Error())
+		return nil, err
 	}
-	format = strings.ToLower(format) // "jpeg" or "png"
+	log.Printf("DEBUG: Parsed width = %d", targetWidth)
 
-	// 4) 目標サイズの計算。拡大はしない
-	srcW, srcH := img.Bounds().Dx(), img.Bounds().Dy()
-	targetW := width
-	targetH := height
-
-	// 幅が元画像より大きい場合は元画像のサイズに制限
-	if targetW > srcW {
-		targetW = srcW
-		// 高さもアスペクト比を維持して調整
-		if height > 0 {
-			scale := float64(targetW) / float64(width)
-			targetH = int(math.Round(float64(height) * scale))
-		} else {
-			targetH = srcH
-		}
-	}
-
-	// 高さが元画像より大きい場合も同様に制限
-	if targetH > srcH {
-		targetH = srcH
-		// 幅もアスペクト比を維持して調整
-		scale := float64(targetH) / float64(height)
-		targetW = int(math.Round(float64(targetW) * scale))
-	}
-
-	if targetW <= 0 || targetH <= 0 {
-		return nil, writeError(ctx, ev, http.StatusBadRequest, "calculated size invalid")
-	}
-
-	// 5) リサイズ（CatmullRom）
-	dst := resize(img, targetW, targetH)
-
-	// 6) フォーマット維持 + 10MB 制約
-	out, outCT, err := encodeWithConstraints(dst, format)
+	s3Key, err := parseURLToS3Key(u)
 	if err != nil {
-		return nil, writeError(ctx, ev, http.StatusInternalServerError, "encode error: "+err.Error())
+		return nil, err
+	}
+	log.Printf("DEBUG: Parsed S3 key base = %s", s3Key)
+
+	ob, err := fetchOriginalImgFromS3(ctx, bucketName, s3Key)
+	if err != nil {
+		return nil, err
+	}
+	defer ob.Close()
+
+	img, ex, err := decodeImage(ob)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("DEBUG: Decoded image format = %s", ex)
+
+	resizedImg, err := resize(img, ex, targetWidth)
+	if err != nil {
+		return nil, err
 	}
 
-	// 7) 応答（キャッシュ系ヘッダは任意）
-	// WriteGetObjectResponseはHTTP APIを直接呼び出す
-	writeErr := writeGetObjectResponse(ctx, ev.GetObjectContext.OutputRoute, ev.GetObjectContext.OutputToken, http.StatusOK, outCT, out)
+	writeErr := writeGetObjectResponse(ctx, ev, ex, resizedImg)
 	if writeErr != nil {
 		return nil, writeErr
 	}
 	return nil, nil
 }
 
-func writeError(ctx context.Context, ev events.S3ObjectLambdaEvent, code int, msg string) error {
-	log.Printf("ERROR %d: %s", code, msg)
-	_ = writeGetObjectResponse(ctx, ev.GetObjectContext.OutputRoute, ev.GetObjectContext.OutputToken, code, "text/plain", []byte(msg))
-	return errors.New(msg)
+func parseURLToTargetWidth(u *url.URL) (int, error) {
+	allowedWidths := map[int]bool{240: true, 300: true, 460: true, 700: true, 1040: true}
+
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+
+	widthStr := parts[len(parts)-1]
+	width, err := strconv.Atoi(widthStr)
+	if err != nil || !allowedWidths[width] {
+		log.Printf("DEBUG: Width parse error or invalid: %v, allowed widths: %v", width, allowedWidths)
+		return 0, errors.New("width must be one of 240,300,460,700,1040")
+	}
+	return width, nil
 }
 
-// writeGetObjectResponse は S3 Object Lambda の WriteGetObjectResponse API を HTTP で直接呼び出す
-func writeGetObjectResponse(ctx context.Context, route, token string, statusCode int, contentType string, body []byte) error {
-	url := route + "?write=true"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("x-amz-request-token", token)
-	req.Header.Set("x-amz-status-code", strconv.Itoa(statusCode))
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Cache-Control", "public, max-age=31536000, immutable")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return errors.New("WriteGetObjectResponse failed with status: " + resp.Status)
-	}
-	return nil
+func parseURLToS3Key(u *url.URL) (string, error) {
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	return strings.Join(parts[:len(parts)-1], "/"), nil
 }
 
-// ----- S3 読み取り（baseKeyで） -----
-
-func fetchOriginalFromS3(ctx context.Context, bucket, key string) ([]byte, string, error) {
-	// 10MB超はエラー
-	getOut, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+func fetchOriginalImgFromS3(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return nil, "", err
-	}
-	defer getOut.Body.Close()
-
-	// Content-Length を先に見て 10MB 超なら早期エラー
-	if getOut.ContentLength != nil && *getOut.ContentLength > maxBytes {
-		return nil, "", errors.New("source object too large (>10MB)")
+		return nil, err
 	}
 
-	// 念のため読み取りも制限
-	lim := io.LimitedReader{R: getOut.Body, N: maxBytes + 1}
-	buf := &bytes.Buffer{}
-	if _, err := io.Copy(buf, &lim); err != nil {
-		return nil, "", err
+	if aws.ToInt64(res.ContentLength) > maxBytes {
+		return nil, errors.New("source object too large (>10MB)")
 	}
-	if int64(buf.Len()) > maxBytes {
-		return nil, "", errors.New("source object too large (>10MB)")
+
+	allowedContentTypes := map[string]bool{"image/jpeg": true, "image/png": true}
+	ct := aws.ToString(res.ContentType)
+	if !allowedContentTypes[ct] {
+		log.Printf("DEBUG: Disallowed content type: %s", ct)
 	}
-	ct := aws.ToString(getOut.ContentType)
-	return buf.Bytes(), ct, nil
+
+	return res.Body, nil
 }
 
-// ----- 画像処理ユーティリティ -----
+func decodeImage(ob io.Reader) (image.Image, string, error) {
+	img, format, err := image.Decode(ob)
+	if err != nil {
+		return nil, "", fmt.Errorf("decode error (jpeg/png only): %v", err)
+	}
 
-func resize(src image.Image, w, h int) image.Image {
-	dst := image.NewRGBA(image.Rect(0, 0, w, h))
-	draw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
-	return dst
+	allowedExtensions := map[string]bool{"jpeg": true, "jpg": true, "png": true}
+	if !allowedExtensions[format] {
+		return nil, "", fmt.Errorf("unsupported image format: %s", format)
+	}
+	return img, format, nil
 }
 
-func encodeWithConstraints(img image.Image, format string) ([]byte, string, error) {
-	switch strings.ToLower(format) {
+func resize(src image.Image, format string, targetWidth int) (*bytes.Buffer, error) {
+	srcW, srcH := src.Bounds().Dx(), src.Bounds().Dy()
+	if targetWidth <= 0 || srcW <= 0 || srcH <= 0 {
+		return nil, fmt.Errorf("invalid image dimensions: srcW=%d, srcH=%d, targetWidth=%d", srcW, srcH, targetWidth)
+	}
+
+	if targetWidth == srcW {
+		return encodeWithConstraints(src, format)
+	}
+
+	targetHeight := calculateTargetHeight(srcW, srcH, targetWidth)
+	if targetHeight <= 0 {
+		return nil, fmt.Errorf("calculated invalid target height: %d", targetHeight)
+	}
+
+	resizedImg, err := resizeLanczos(src, targetWidth, targetHeight)
+	if err != nil {
+		return nil, fmt.Errorf("resize error: %w", err)
+	}
+
+	out, err := encodeWithConstraints(resizedImg, format)
+	if err != nil {
+		return nil, fmt.Errorf("encode error: %w", err)
+	}
+
+	return out, nil
+}
+
+func resizeLanczos(src image.Image, width, height int) (image.Image, error) {
+	resized := imaging.Resize(src, width, height, imaging.Lanczos)
+	return resized, nil
+}
+
+func calculateTargetHeight(srcW, srcH, targetW int) int {
+	return int(math.Round(float64(srcH) * float64(targetW) / float64(srcW)))
+}
+
+func encodeWithConstraints(img image.Image, format string) (*bytes.Buffer, error) {
+	switch format {
 	case "jpeg", "jpg":
 		return encodeJPEGConstrained(img)
 	case "png":
 		return encodePNGConstrained(img)
 	default:
-		return nil, "", errors.New("unsupported format: " + format)
+		return nil, errors.New("unsupported format: " + format)
 	}
 }
 
-func encodeJPEGConstrained(img image.Image) ([]byte, string, error) {
+func encodeJPEGConstrained(img image.Image) (*bytes.Buffer, error) {
 	qualities := []int{95, 90, 85, 80, 75, 70, 65, 60}
-	for {
-		for _, q := range qualities {
-			var buf bytes.Buffer
-			if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: q}); err != nil {
-				return nil, "", err
-			}
-			if buf.Len() <= maxBytes {
-				return buf.Bytes(), "image/jpeg", nil
-			}
+	for _, q := range qualities {
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: q}); err != nil {
+			return nil, err
 		}
-		// まだ大きい → 0.9倍
-		b := img.Bounds()
-		nw := int(float64(b.Dx()) * 0.9)
-		nh := int(float64(b.Dy()) * 0.9)
-		if nw < 32 || nh < 32 {
-			return nil, "", errors.New("cannot satisfy 10MB limit for jpeg")
+		if buf.Len() <= maxBytes {
+			return &buf, nil
 		}
-		img = resize(img, nw, nh)
 	}
+	return nil, errors.New("cannot satisfy 10MB limit for jpeg")
 }
 
-func encodePNGConstrained(img image.Image) ([]byte, string, error) {
+func encodePNGConstrained(img image.Image) (*bytes.Buffer, error) {
 	levels := []png.CompressionLevel{png.DefaultCompression, png.BestCompression}
-	for {
-		for _, lvl := range levels {
-			var buf bytes.Buffer
-			enc := png.Encoder{CompressionLevel: lvl}
-			if err := enc.Encode(&buf, img); err != nil {
-				return nil, "", err
-			}
-			if buf.Len() <= maxBytes {
-				return buf.Bytes(), "image/png", nil
-			}
+	for _, lvl := range levels {
+		var buf bytes.Buffer
+		enc := png.Encoder{CompressionLevel: lvl}
+		if err := enc.Encode(&buf, img); err != nil {
+			return nil, err
 		}
-		// まだ大きい → 0.9倍
-		b := img.Bounds()
-		nw := int(float64(b.Dx()) * 0.9)
-		nh := int(float64(b.Dy()) * 0.9)
-		if nw < 32 || nh < 32 {
-			return nil, "", errors.New("cannot satisfy 10MB limit for png")
+		if buf.Len() <= maxBytes {
+			return &buf, nil
 		}
-		img = resize(img, nw, nh)
 	}
+	return nil, errors.New("cannot satisfy 10MB limit for png")
+}
+
+func writeGetObjectResponse(ctx context.Context, ev events.S3ObjectLambdaEvent, contentType string, body *bytes.Buffer) error {
+	input := &s3.WriteGetObjectResponseInput{
+		RequestRoute:  aws.String(ev.GetObjectContext.OutputRoute),
+		RequestToken:  aws.String(ev.GetObjectContext.OutputToken),
+		StatusCode:    aws.Int32(http.StatusOK),
+		ContentType:   aws.String(contentType),
+		CacheControl:  aws.String(cacheControlImmutable),
+		ContentLength: aws.Int64(int64(body.Len())),
+		Body:          body,
+	}
+
+	_, err := s3Client.WriteGetObjectResponse(ctx, input)
+	return err
 }
